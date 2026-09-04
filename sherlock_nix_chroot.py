@@ -10,7 +10,7 @@ State is deliberately separated:
 
 * ``nix_dir`` contains the Nix store and is normally derived from ``L_SCRATCH``.
 * ``runtime_home`` contains ``~/.nix-profile`` and defaults to the user's home.
-* ``helper_dir`` caches the pinned ``nix-user-chroot`` executable.
+* ``nix_user_chroot_dir`` caches the pinned ``nix-user-chroot`` executable.
 * ``tmp_dir`` keeps temporary build data off the home filesystem.
 
 The helper download is SHA-256 verified before execution. The initial Nix
@@ -101,7 +101,7 @@ class Options(argparse.Namespace):
     nix_dir: Optional[Path]
     tmp_dir: Optional[Path]
     runtime_home: Optional[Path]
-    helper_dir: Optional[Path]
+    nix_user_chroot_dir: Optional[Path]
     no_shell: bool
 
 
@@ -153,7 +153,7 @@ def build_parser() -> argparse.ArgumentParser:
         help="HOME inside the chroot (default: current user home)",
     )
     parser.add_argument(
-        "--helper-dir",
+        "--nix-user-chroot-dir",
         type=Path,
         metavar="PATH",
         help="nix-user-chroot cache directory (default: ~/.local/bin)",
@@ -208,7 +208,7 @@ def file_sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
-def prepare_helper(helper_dir: Path, curl_path: str) -> Path:
+def prepare_nix_user_chroot(nix_user_chroot_dir: Path, curl_path: str) -> Path:
     """Return a verified, executable ``nix-user-chroot`` helper.
 
     A matching cached version is reused. Otherwise the pinned release is
@@ -217,21 +217,22 @@ def prepare_helper(helper_dir: Path, curl_path: str) -> Path:
     """
     # Version the real executable so future upgrades can coexist with older
     # cached releases and the stable convenience symlink below.
-    helper_path = helper_dir / "nix-user-chroot-{}".format(
+    nix_user_chroot_path = nix_user_chroot_dir / "nix-user-chroot-{}".format(
         NIX_USER_CHROOT_VERSION
     )
-    helper_dir.mkdir(parents=True, exist_ok=True)
+    nix_user_chroot_dir.mkdir(parents=True, exist_ok=True)
 
     # A cached executable is trusted only after hashing its current contents.
-    helper_valid = (
-        helper_path.is_file()
-        and file_sha256(helper_path) == NIX_USER_CHROOT_SHA256
+    nix_user_chroot_valid = (
+        nix_user_chroot_path.is_file()
+        and file_sha256(nix_user_chroot_path) == NIX_USER_CHROOT_SHA256
     )
-    if not helper_valid:
+    if not nix_user_chroot_valid:
         # mkstemp prevents concurrent runs from clobbering one another and
         # avoids predictable-name/symlink attacks in the helper directory.
         descriptor, download_name = tempfile.mkstemp(
-            prefix=".{}.download.".format(helper_path.name), dir=str(helper_dir)
+            prefix=".{}.download.".format(nix_user_chroot_path.name),
+            dir=str(nix_user_chroot_dir),
         )
         os.close(descriptor)
         download_path = Path(download_name)
@@ -257,7 +258,7 @@ def prepare_helper(helper_dir: Path, curl_path: str) -> Path:
             # The temporary file lives beside the destination, making replace
             # atomic on the same filesystem. Set executable mode before publish.
             download_path.chmod(0o755)
-            os.replace(str(download_path), str(helper_path))
+            os.replace(str(download_path), str(nix_user_chroot_path))
         # Always remove an incomplete download. After os.replace this is a
         # harmless no-op because the temporary pathname no longer exists.
         finally:
@@ -268,11 +269,11 @@ def prepare_helper(helper_dir: Path, curl_path: str) -> Path:
 
     # The convenience symlink is created only when no file or link occupies the
     # stable name; this avoids overwriting a user-managed or even dangling link.
-    stable_link = helper_dir / "nix-user-chroot"
-    if not os.path.lexists(str(stable_link)):
-        stable_link.symlink_to(helper_path.name)
+    nix_user_chroot_stable_link = nix_user_chroot_dir / "nix-user-chroot"
+    if not os.path.lexists(str(nix_user_chroot_stable_link)):
+        nix_user_chroot_stable_link.symlink_to(nix_user_chroot_path.name)
 
-    return helper_path
+    return nix_user_chroot_path
 
 
 def ensure_directory(path: Path, mode: int) -> None:
@@ -286,7 +287,7 @@ def ensure_directory(path: Path, mode: int) -> None:
 
 
 def run_in_chroot(
-    helper_path: Path,
+    nix_user_chroot_path: Path,
     nix_dir: Path,
     runtime_home: Path,
     tmp_dir: Path,
@@ -322,7 +323,10 @@ def run_in_chroot(
     )
     # nix-user-chroot expects the backing store first, followed by the command
     # to execute inside the resulting mount/user namespace.
-    command: List[str] = [str(helper_path), str(nix_dir)] + list(arguments)
+    command: List[str] = [
+        str(nix_user_chroot_path),
+        str(nix_dir),
+    ] + list(arguments)
     # Keep check handling here rather than in each caller so probe commands can
     # opt into nonzero results without weakening normal error propagation.
     completed: subprocess.CompletedProcess = subprocess.run(
@@ -375,7 +379,9 @@ def main(arguments: Sequence[str]) -> int:
     # Keep the helper and user profile in the persistent home filesystem by
     # default, while the much larger Nix store and build data live on scratch.
     home = Path.home()
-    helper_dir = options.helper_dir or home / ".local" / "bin"
+    nix_user_chroot_dir = (
+        options.nix_user_chroot_dir or home / ".local" / "bin"
+    )
     runtime_home = options.runtime_home or home
 
     # Resolve all host-side dependencies before downloading or creating state so
@@ -384,7 +390,9 @@ def main(arguments: Sequence[str]) -> int:
     unshare_path = require_command("unshare")
     require_command("bash")
 
-    helper_path = prepare_helper(helper_dir, curl_path)
+    nix_user_chroot_path = prepare_nix_user_chroot(
+        nix_user_chroot_dir, curl_path
+    )
 
     # Probe the kernel feature used by nix-user-chroot itself. Merely finding the
     # unshare executable does not guarantee that the cluster permits user/PID
@@ -412,11 +420,11 @@ def main(arguments: Sequence[str]) -> int:
     (nix_config_dir / "nix.conf").write_text(NIX_CONFIG + "\n", encoding="utf-8")
 
     # Bundle the invariant mount/environment arguments shared by every command.
-    chroot_context = (helper_path, nix_dir, runtime_home, tmp_dir)
+    nix_user_chroot_context = (nix_user_chroot_path, nix_dir, runtime_home, tmp_dir)
     # The per-user profile executable is the installation marker. Probe inside
     # the chroot because the host cannot see the same /nix mount arrangement.
     nix_present = run_in_chroot(
-        *chroot_context,
+        *nix_user_chroot_context,
         ["bash", "-c", 'test -x "$HOME/.nix-profile/bin/nix"'],
         check=False
     ).returncode == 0
@@ -428,7 +436,7 @@ def main(arguments: Sequence[str]) -> int:
         # download cannot be hidden by the shell process consuming the pipeline.
         logger.info("installing Nix into %s", nix_dir)
         run_in_chroot(
-            *chroot_context,
+            *nix_user_chroot_context,
             [
                 "bash",
                 "-c",
@@ -440,7 +448,7 @@ def main(arguments: Sequence[str]) -> int:
     # Source Nix's profile script and execute the binary as a post-install/reuse
     # health check before attempting optional higher-level operations.
     run_in_chroot(
-        *chroot_context,
+        *nix_user_chroot_context,
         ["bash", "-lc", NIX_PROFILE_INIT + "\nnix --version"]
     )
 
@@ -449,7 +457,7 @@ def main(arguments: Sequence[str]) -> int:
         # source, preserving spaces and preventing shell metacharacter expansion.
         logger.info("applying Home Manager configuration %s", hm_flake)
         run_in_chroot(
-            *chroot_context,
+            *nix_user_chroot_context,
             [
                 "bash",
                 "-lc",
@@ -464,7 +472,7 @@ def main(arguments: Sequence[str]) -> int:
     # tokens as positional parameters lets `exec "$@"` preserve argument bounds.
     if command_arguments:
         run_in_chroot(
-            *chroot_context,
+            *nix_user_chroot_context,
             [
                 "bash",
                 "-lc",
@@ -479,7 +487,7 @@ def main(arguments: Sequence[str]) -> int:
         # so its exit status and lifetime flow directly back to this script.
         logger.info("entering the Nix environment; exit to leave the chroot")
         run_in_chroot(
-            *chroot_context,
+            *nix_user_chroot_context,
             [
                 "bash",
                 "-lc",
